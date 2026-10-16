@@ -1,0 +1,16 @@
+_bin/
+_logs/
+_result/
+data/
+model_configs/
+model_outputs/
+VPureETE2_r5/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# factor data
+VCAT_1D_LAG20_60_120_r5_LGBM/
+VCAT_five_minute_LAG20_60_120_r5_LGBM/
