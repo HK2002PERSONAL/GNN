@@ -1,14 +1,19 @@
+import sys
+import os
 import pandas as pd
+
+# Add the project root directory to the Python path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from BackTester.back_testV2 import batch_test
 
 if __name__ == "__main__":
 
-    TEST_MARK = Signal_Mark = "V0V2"
+    TEST_MARK = Signal_Mark = "HIST_ORTH"
 
     SMOOTH_DECAY = 15
 
-    signal_data = pd.read_parquet("model_outputs/hist_test_a6_1D_lag20_60_120_v0v2_c4.0%.pqt")
+    signal_data = pd.read_parquet("model_outputs/hist_test_Hist_Orth_1D_lag20_60_120_v0v14v2_c4.0%.pqt")
     signal_data['date'] = pd.to_datetime(signal_data['date'], format="%Y%m%d")
     signal_data = signal_data.set_index(['code', 'date']).sort_index()
 

@@ -825,3 +825,342 @@ class HIST_a11(FClipBase):
         return self.fc_out(all_info_fore)
 
         
+class HIST_a12(FClipBase):
+    """model 10 GCN[Industry]GCN[Risk] + GCN[RetCorr]GCN[PrcCorr]"""
+    def __init__(self, d_feat=6, hidden_size=64, clip=5):
+        super().__init__(clip=clip)
+
+        self.d_feat = d_feat
+        self.hidden_size = hidden_size
+
+        self.encoder = nn.Sequential(
+            nn.Linear(d_feat, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        for m in self.encoder:
+            if isinstance(m, nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+
+        self.predefined_info_block_1_1 = GCN_InfoShare_block(hidden_size)
+        self.predefined_info_block_1_2 = GCN_InfoShare_block(hidden_size)
+
+        self.predefined_info_block_2_1 = GCN_InfoShare_block(hidden_size)
+        self.predefined_info_block_2_2 = GCN_InfoShare_block(hidden_size)
+
+        self.fc_i_fore = nn.Linear(hidden_size, hidden_size)
+        torch.nn.init.xavier_uniform_(self.fc_i_fore.weight)
+        self.fc_out = nn.Linear(hidden_size, 1)
+        torch.nn.init.xavier_uniform_(self.fc_out.weight)
+
+
+    def forward(
+        self,
+        x: torch.Tensor, # [N, F]
+        concept_matrix_1_1: torch.Tensor, # [N, C] 
+        concept_matrix_1_2: torch.Tensor, # [N, C] 
+        concept_matrix_2_1: torch.Tensor, # [N, C] 
+        concept_matrix_2_2: torch.Tensor, # [N, C] 
+        market_value: torch.Tensor, # [N] 
+    ) -> torch.Tensor:
+        
+        x_hidden = self.encoder(self.fclip(x))
+
+        # Layer 1
+        p1_1_info_fore, p1_1_info_back = self.predefined_info_block_1_1(x_hidden, concept_matrix_1_1, market_value)
+        p1_2_info_fore, p1_2_info_back = self.predefined_info_block_1_2(x_hidden, concept_matrix_1_2, market_value)
+
+        x_hidden_dL1 = x_hidden - p1_1_info_back - p1_2_info_back
+
+        # Layer 2
+        p2_1_info_fore, p2_1_info_back = self.predefined_info_block_2_1(x_hidden_dL1, concept_matrix_2_1, market_value)
+        p2_2_info_fore, p2_2_info_back = self.predefined_info_block_2_2(x_hidden_dL1, concept_matrix_2_2, market_value)
+
+        x_hidden_dL1L2 = x_hidden_dL1 - p2_1_info_back - p2_2_info_back
+
+        # final layer
+        i_info_fore = nn.functional.leaky_relu(self.fc_i_fore(x_hidden_dL1L2))
+
+        # output layer
+        all_info_fore = p1_1_info_fore + p1_2_info_fore + p2_1_info_fore + p2_2_info_fore + i_info_fore
+
+        return self.fc_out(all_info_fore)
+        
+
+class HIST_FactorGCL_V2(FClipBase):
+    """
+    model FactorGCL V2
+    GCN[Industry] + GCN[Risk] + GCN[corr] (与 HIST_a10 相同的三概念结构)
+    dual output for contractive learning
+
+    概念结构:
+        概念 1_1 (v0)  : 一级行业
+        概念 1_2 (v14) : 风险因子相关边
+        概念 2   (v{n}) : 相关性边
+    """
+    def __init__(
+        self, 
+        d_feat=6, hidden_size=64, clip=5,
+        ew1: bool = True, ew2: bool = True, ew3: bool = True,
+    ):
+        super().__init__(clip=clip)
+
+        self.d_feat = d_feat
+        self.hidden_size = hidden_size
+
+        self.encoder = nn.Sequential(
+            nn.Linear(d_feat, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        for m in self.encoder:
+            if isinstance(m, nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+
+        self.fut_encoder = nn.Sequential(
+            nn.Linear(d_feat, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        for m in self.fut_encoder:
+            if isinstance(m, nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+
+        # 与 HIST_a10 相同的三概念结构
+        self.predefined_info_block_1_1 = GCN_InfoShare_block(hidden_size, ew=ew1)
+        self.predefined_info_block_1_2 = GCN_InfoShare_block(hidden_size, ew=ew2)
+        self.predefined_info_block_2 = GCN_InfoShare_block(hidden_size, ew=ew3)
+
+        self.fc_i_fore = nn.Linear(hidden_size, hidden_size)
+        torch.nn.init.xavier_uniform_(self.fc_i_fore.weight)
+        self.fc_out = nn.Linear(hidden_size, 1)
+        torch.nn.init.xavier_uniform_(self.fc_out.weight)
+
+
+    def real_forward(
+        self,
+        x: torch.Tensor, # [N, F]
+        concept_matrix_1_1: torch.Tensor, # [N, C] 
+        concept_matrix_1_2: torch.Tensor, # [N, C] 
+        concept_matrix_2: torch.Tensor, # [N, C] 
+        market_value: torch.Tensor, # [N] 
+    ) -> torch.Tensor:
+        
+        x_hidden = self.encoder(self.fclip(x))
+
+        # Layer 1: 行业 + 风险并行
+        p1_1_info_fore, p1_1_info_back = self.predefined_info_block_1_1(x_hidden, concept_matrix_1_1, market_value)
+        p1_2_info_fore, p1_2_info_back = self.predefined_info_block_1_2(x_hidden, concept_matrix_1_2, market_value)
+
+        x_hidden_dL1 = x_hidden - p1_1_info_back - p1_2_info_back
+
+        # Layer 2: 相关性边
+        p2_info_fore, p2_info_back = self.predefined_info_block_2(x_hidden_dL1, concept_matrix_2, market_value)
+
+        x_hidden_dp1p2 = x_hidden_dL1 - p2_info_back
+
+        # final layer
+        i_info_fore = nn.functional.leaky_relu(self.fc_i_fore(x_hidden_dp1p2))
+
+        # output layer
+        all_info_fore = p1_1_info_fore + p1_2_info_fore + p2_info_fore + i_info_fore
+
+        return self.fc_out(all_info_fore), i_info_fore
+
+    
+    def goof_forward(
+        self,
+        x_fut: torch.Tensor, # [N, F]
+        concept_matrix_1_1: torch.Tensor, # [N, C] 
+        concept_matrix_1_2: torch.Tensor, # [N, C] 
+        concept_matrix_2: torch.Tensor, # [N, C] 
+        market_value: torch.Tensor, # [N] 
+    ) -> torch.Tensor:
+        
+        x_hidden = self.fut_encoder(self.fclip(x_fut))
+
+        with torch.no_grad():
+            # Layer 1: 行业 + 风险并行
+            _, p1_1_info_back = self.predefined_info_block_1_1(x_hidden, concept_matrix_1_1, market_value)
+            _, p1_2_info_back = self.predefined_info_block_1_2(x_hidden, concept_matrix_1_2, market_value)
+
+            x_hidden_dL1 = x_hidden - p1_1_info_back - p1_2_info_back
+
+            # Layer 2: 相关性边
+            _, p2_info_back = self.predefined_info_block_2(x_hidden_dL1, concept_matrix_2, market_value)
+
+            x_hidden_dp1p2 = x_hidden_dL1 - p2_info_back
+
+            # final layer
+            i_info_fore = nn.functional.leaky_relu(self.fc_i_fore(x_hidden_dp1p2))
+
+        return i_info_fore
+
+
+    def forward(
+        self,
+        concept_matrix_1_1: torch.Tensor, # [N, C] 
+        concept_matrix_1_2: torch.Tensor, # [N, C] 
+        concept_matrix_2: torch.Tensor, # [N, C] 
+        market_value: torch.Tensor, # [N] 
+        x: torch.Tensor, # [N, F]
+        x_fut: torch.Tensor | None = None, # [N, F]
+        output: bool = False
+    ):
+        if output:
+            batch_result, _ = self.real_forward(
+                x, concept_matrix_1_1, concept_matrix_1_2, concept_matrix_2, market_value)
+            return batch_result
+
+        else:
+            batch_result, real_indi_info = self.real_forward(
+                x, concept_matrix_1_1, concept_matrix_1_2, concept_matrix_2, market_value)
+            goof_indi_info = self.goof_forward(
+                x_fut, concept_matrix_1_1, concept_matrix_1_2, concept_matrix_2, market_value)
+
+            return batch_result, real_indi_info, goof_indi_info
+
+
+class HIST_FactorGCL(FClipBase):
+    """
+    model FactorGCL 
+    GCN + GCN
+    dual output for contractive learning
+
+    """
+    def __init__(
+        self, 
+        d_feat=6, hidden_size=64, clip=5,
+        ew1: bool = True, ew2: bool = True, 
+    ):
+        super().__init__(clip=clip)
+
+        self.d_feat = d_feat
+        self.hidden_size = hidden_size
+
+        self.encoder = nn.Sequential(
+            nn.Linear(d_feat, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        for m in self.encoder:
+            if isinstance(m, nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+
+        self.fut_encoder = nn.Sequential(
+            nn.Linear(d_feat, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        for m in self.fut_encoder:
+            if isinstance(m, nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+
+        self.predefined_info_block_1 = GCN_InfoShare_block(hidden_size, ew=ew1)
+        self.predefined_info_block_2 = GCN_InfoShare_block(hidden_size, ew=ew2)
+
+        self.fc_i_fore = nn.Linear(hidden_size, hidden_size)
+        torch.nn.init.xavier_uniform_(self.fc_i_fore.weight)
+        self.fc_out = nn.Linear(hidden_size, 1)
+        torch.nn.init.xavier_uniform_(self.fc_out.weight)
+
+
+    def real_forward(
+        self,
+        x: torch.Tensor, # [N, F]
+        concept_matrix_1: torch.Tensor, # [N, C] 
+        concept_matrix_2: torch.Tensor, # [N, C] 
+        market_value: torch.Tensor, # [N] 
+    ) -> torch.Tensor:
+        
+        x_hidden = self.encoder(self.fclip(x))
+
+        # Layer 1
+        p1_info_fore, p1_info_back = self.predefined_info_block_1(x_hidden, concept_matrix_1, market_value)
+        x_hidden_dp1 = x_hidden - p1_info_back
+
+        # Layer 2
+        p2_info_fore, p2_info_back = self.predefined_info_block_2(x_hidden_dp1, concept_matrix_2, market_value)
+        x_hidden_dp1p2 = x_hidden_dp1 - p2_info_back
+
+        # final layer
+        i_info_fore = nn.functional.leaky_relu(self.fc_i_fore(x_hidden_dp1p2))
+
+        # output layer
+        all_info_fore = p1_info_fore + p2_info_fore + i_info_fore
+
+        return self.fc_out(all_info_fore), i_info_fore
+
+    
+    def goof_forward(
+        self,
+        x_fut: torch.Tensor, # [N, F]
+        concept_matrix_1: torch.Tensor, # [N, C] 
+        concept_matrix_2: torch.Tensor, # [N, C] 
+        market_value: torch.Tensor, # [N] 
+    ) -> torch.Tensor:
+        
+        x_hidden = self.fut_encoder(self.fclip(x_fut))
+
+        with torch.no_grad():
+            # Layer 1
+            _, p1_info_back = self.predefined_info_block_1(x_hidden, concept_matrix_1, market_value)
+            x_hidden_dp1 = x_hidden - p1_info_back
+
+            # Layer 2
+            _, p2_info_back = self.predefined_info_block_2(x_hidden_dp1, concept_matrix_2, market_value)
+            x_hidden_dp1p2 = x_hidden_dp1 - p2_info_back
+
+            # final layer
+            i_info_fore = nn.functional.leaky_relu(self.fc_i_fore(x_hidden_dp1p2))
+
+        return i_info_fore
+
+
+    def forward(
+        self,
+        concept_matrix_1: torch.Tensor, # [N, C] 
+        concept_matrix_2: torch.Tensor, # [N, C] 
+        market_value: torch.Tensor, # [N] 
+        x: torch.Tensor, # [N, F]
+        x_fut: torch.Tensor | None = None, # [N, F]
+        output: bool = False
+    ):
+        if output:
+            batch_result, _ = self.real_forward(
+                x, concept_matrix_1, concept_matrix_2, market_value)
+            return batch_result
+
+        else:
+            batch_result, real_indi_info = self.real_forward(
+                x, concept_matrix_1, concept_matrix_2, market_value)
+            goof_indi_info = self.goof_forward(
+                x_fut, concept_matrix_1, concept_matrix_2, market_value)
+
+            return batch_result, real_indi_info, goof_indi_info
+
+
+class HIST_FactorGCL_V1(HIST_FactorGCL):
+
+    def goof_forward(
+        self,
+        x_fut: torch.Tensor, # [N, F]
+        concept_matrix_1: torch.Tensor, # [N, C] 
+        concept_matrix_2: torch.Tensor, # [N, C] 
+        market_value: torch.Tensor, # [N] 
+    ) -> torch.Tensor:
+        
+        with torch.no_grad():
+            x_hidden = self.encoder(self.fclip(x_fut))
+            # Layer 1
+            _, p1_info_back = self.predefined_info_block_1(x_hidden, concept_matrix_1, market_value)
+            x_hidden_dp1 = x_hidden - p1_info_back
+
+            # Layer 2
+            _, p2_info_back = self.predefined_info_block_2(x_hidden_dp1, concept_matrix_2, market_value)
+            x_hidden_dp1p2 = x_hidden_dp1 - p2_info_back
+
+            # final layer
+            i_info_fore = nn.functional.leaky_relu(self.fc_i_fore(x_hidden_dp1p2))
+
+        return i_info_fore

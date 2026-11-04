@@ -1,29 +1,57 @@
-import duckdb
-import pyarrow as pa
-import pyarrow.parquet as pq
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
 
-folder = "data/feature/CAT_five_minute_LAG20_60_120"
-query = f"""
-    SELECT * FROM read_parquet('{folder}/*.pqt')
-    ORDER BY DataDate, SecuCode
-"""
+# ========== 读取数据，计算收益率/价格相关性矩阵 ==========
+print("读取数据...")
+data = pd.read_parquet("data/raw_data/stock_edge.pqt")
+data = data.reset_index(drop=False).set_index(["SecuCode", "DataDate"]).sort_index()
+ret = data['DailyReturn'].unstack().iloc[:, -240:].dropna().T
+prc = (ret + 1).cumprod()
+ret_corr_matrix = ret.corr()
+prc_corr_matrix = prc.corr()
 
-con = duckdb.connect()
-con.execute("PRAGMA enable_progress_bar")
-# con.execute("SET memory_limit = '8GB'")          # 可选，超出会溢出到磁盘
+# ========== 绘制上半三角相关系数分布直方图 ==========
+def get_upper_triangle_values(corr_matrix):
+    """提取相关系数矩阵上半三角（不含对角线）的所有值"""
+    mask = np.triu(np.ones_like(corr_matrix, dtype=bool), k=1)
+    return corr_matrix.values[mask]
 
-# 1. 用空 DataFrame 生成带 MultiIndex 的 pandas 元数据
-empty = con.execute(query + " LIMIT 0").df().set_index(["DataDate", "SecuCode"])
-pandas_meta = pa.Table.from_pandas(empty).schema.metadata   # 含 b'pandas' 键
+def plot_corr_histogram(ax, values, title, color):
+    """绘制相关系数分布直方图，标注5%和95%分位数分割线"""
+    q05 = np.percentile(values, 5)
+    q95 = np.percentile(values, 95)
+    
+    ax.hist(values, bins=100, color=color, edgecolor='white', alpha=0.7)
+    ax.axvline(q05, color='red', linestyle='--', linewidth=2, 
+               label=f'5%分位数: {q05:.4f}')
+    ax.axvline(q95, color='green', linestyle='--', linewidth=2, 
+               label=f'95%分位数: {q95:.4f}')
+    ax.set_xlabel('相关系数')
+    ax.set_ylabel('频数')
+    ax.set_title(title)
+    ax.legend()
+    return q05, q95
 
-# 2. 拿到 DuckDB 结果的真实 schema，贴上 pandas 元数据
-duck_schema = con.execute(query + " LIMIT 0").arrow().schema
-final_schema = duck_schema.with_metadata({**(duck_schema.metadata or {}), **pandas_meta})
+# 提取上半三角相关系数
+ret_values = get_upper_triangle_values(ret_corr_matrix)
+prc_values = get_upper_triangle_values(prc_corr_matrix)
 
-# 3. 流式写出
-with pq.ParquetWriter("CAT_five_minute_LAG20_60_120.pqt", final_schema, compression="zstd") as writer:
-    reader = con.execute(query).to_arrow_reader(batch_size=500_000)
-    for batch in reader:
-        writer.write_batch(batch)
+# 创建图形
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
-con.close()
+# 绘制直方图
+q05_ret, q95_ret = plot_corr_histogram(ax1, ret_values, '收益率相关系数分布（上半三角）', 'steelblue')
+q05_prc, q95_prc = plot_corr_histogram(ax2, prc_values, '价格相关系数分布（上半三角）', 'coral')
+
+plt.tight_layout()
+plt.savefig('correlation_distribution.png', dpi=150, bbox_inches='tight')
+print("图表已保存至: correlation_distribution.png")
+
+# 显示统计信息
+print("\n========== 统计信息 ==========")
+print(f"股票数量: {ret_corr_matrix.shape[0]}")
+print(f"收益率相关系数: 5%分位数={q05_ret:.4f}, 95%分位数={q95_ret:.4f}, 均值={np.mean(ret_values):.4f}, 中位数={np.median(ret_values):.4f}")
+print(f"价格相关系数:   5%分位数={q05_prc:.4f}, 95%分位数={q95_prc:.4f}, 均值={np.mean(prc_values):.4f}, 中位数={np.median(prc_values):.4f}")
+
+plt.show()

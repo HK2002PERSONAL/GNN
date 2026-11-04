@@ -2,17 +2,17 @@
 
 模型 HIST_a10 用三个 GCN_InfoShare_block，需要三种预定义概念（边）：
     概念 1_1 (v0)  : 一级行业         —— IndustryCodeNew
-    概念 1_2 (v12) : 风险因子相关边     —— data/edges/edges_v12/{day}.npz 的连通分量
+    概念 1_2 (v14) : 风险因子相关边     —— data/edges/edges_v14/{day}.npz 的连通分量
     概念 2   (v{n}) : 可选相关性边连通分量 —— data/edges/edges_v{n}/{day}.npz 的连通分量
 
 数据由 DataBuilder/hist_data_builder/build_GCN_GCN_GCN_data.py 产出：
-    data/hist_{freq}_lag{lags}_v0v12v{n}/{train,valid,test}.pt
-    样本含 industry_v0 / industry_v12 / industry_v{n} 三个概念标签，已在同一股票集合上对齐。
+    data/hist_{freq}_lag{lags}_v0v14v{n}/{train,valid,test}.pt
+    样本含 industry_v0 / industry_v14 / industry_v{n} 三个概念标签，已在同一股票集合上对齐。
 
     样本字段：
         x             [N, F] 特征
         industry_v0   [N]    行业整数编码（概念 1_1）
-        industry_v12  [N]    v12 风险边连通分量标签（概念 1_2）
+        industry_v14  [N]    v14 风险边连通分量标签（概念 1_2）
         industry_v{n} [N]    第 n 版边连通分量标签（概念 2）
         market_value  [N]    流通市值
         y             [N]    标签（test 集为股票代码）
@@ -22,8 +22,8 @@
     python HIST_models/run_HIST_GCNGCN_GCN.py --edge-version 2
     python HIST_models/run_HIST_GCNGCN_GCN.py --edge-version 2 --hidden_size 64 --clip 0.04
 
-输出：model_configs/best_hist_a10_{freq}_lag{lags}_v0v12v{n}_{clip}.pt、
-      model_outputs/hist_test_a10_{freq}_lag{lags}_v0v12v{n}_{clip}.pqt
+输出：model_configs/best_hist_a10_{freq}_lag{lags}_v0v14v{n}_{clip}.pt、
+      model_outputs/hist_test_a10_{freq}_lag{lags}_v0v14v{n}_{clip}.pqt
 """
 import argparse
 import sys
@@ -48,8 +48,8 @@ from utils.ModelUtils import z_score
 root_seed = 10086
 torch_seed_range = range(root_seed, root_seed + 10, 4)
 
-# 第三边支持的版本（与 build_GCNGCN_GCN_data.py 保持一致，不含 12）
-SUPPORTED_EDGE_VERSIONS = [2, 3, 7, 9, 10]
+# 第三边支持的版本（与 build_GCNGCN_GCN_data.py 保持一致，不含 14）
+SUPPORTED_EDGE_VERSIONS = [2, 3, 7, 8, 9, 10]
 
 
 # ---------------- 概念 -> 概念矩阵 ----------------
@@ -94,16 +94,16 @@ class ICLoss(nn.Module):
 def model_forward(_model, _sample, _device, _edge_version: int):
     """把单个日截面样本喂给 HIST_a10，返回预测值 [N]。
 
-    概念 1_1 = v0 行业，概念 1_2 = v12 风险边连通分量，概念 2 = v{n} 连通分量，
+    概念 1_1 = v0 行业，概念 1_2 = v14 风险边连通分量，概念 2 = v{n} 连通分量，
     三者已在同一股票集合上对齐。
     """
     x = _sample["x"].to(_device)
     industry_v0 = _sample["industry_v0"].to(_device)
-    industry_v12 = _sample["industry_v12"].to(_device)
+    industry_v14 = _sample["industry_v14"].to(_device)
     industry_v3 = _sample[f"industry_v{_edge_version}"].to(_device)
     market_value = _sample["market_value"].to(_device)
     concept_1_1 = industry_to_concept(industry_v0)
-    concept_1_2 = industry_to_concept(industry_v12)
+    concept_1_2 = industry_to_concept(industry_v14)
     concept_2 = industry_to_concept(industry_v3)
     return _model(x, concept_1_1, concept_1_2, concept_2, market_value)
 
@@ -148,7 +148,7 @@ def evaluate(_model, _loader, _loss, _device, _edge_version):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="HIST_a10（GCN+GCN+GCN，v0 行业 + v12 风险边 + v{n} 相关性边）训练")
+    parser = argparse.ArgumentParser(description="HIST_a10（GCN+GCN+GCN，v0 行业 + v14 风险边 + v{n} 相关性边）训练")
     parser.add_argument("--freq", type=str, default="1D", choices=["1D", "five_minute"])
     parser.add_argument("--spans", type=int, nargs="+", default=[20, 60, 120], help="回溯天数列表，如: 20 60 120")
     parser.add_argument("--edge-version", "-v", type=int, default=2, choices=SUPPORTED_EDGE_VERSIONS,
@@ -174,8 +174,8 @@ if __name__ == "__main__":
         clip_mark = f"c{clip:.1f}"
 
     # 数据 version 与 build_GCN_GCN_GCN_data.py 的 SAVE_DIR 保持一致：
-    # data/hist_{freq}_lag{lags}_v0v12v{n}
-    data_version = f"{args.freq}_lag{'_'.join([str(span) for span in args.spans])}_v0v12v{edge_version}"
+    # data/hist_{freq}_lag{lags}_v0v14v{n}
+    data_version = f"{args.freq}_lag{'_'.join([str(span) for span in args.spans])}_v0v14v{edge_version}"
 
     ckpt_path = f"model_configs/best_hist_{model_id}_{data_version}_{clip_mark}"
     out_path = f"model_outputs/hist_test_{model_id}_{data_version}_{clip_mark}.pqt"

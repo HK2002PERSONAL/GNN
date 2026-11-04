@@ -47,7 +47,7 @@ EDGE_PATH = "data/raw_data/stock_edge.pqt"
 EDGE_V14_DIR = "data/edges/edges_v14"
 
 # 第三边支持的版本（不含 14，v14 已固定作为第二边）
-SUPPORTED_EDGE_VERSIONS = [2, 3]
+SUPPORTED_EDGE_VERSIONS = [2, 3, 7, 8]
 
 # 支持的特征频率
 SUPPORTED_FREQS = ["1D", "five_minute"]

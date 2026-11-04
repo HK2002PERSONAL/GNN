@@ -1,4 +1,9 @@
+import sys
+import os
 import pandas as pd
+
+# 将项目根目录加入 Python 路径
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from BackTester.back_testV2 import batch_test
 

@@ -143,7 +143,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="HIST_a6_v2（GCN+HLGCN，v0 行业 + v2 相关性边）训练")
     parser.add_argument("--freq", type=str, default="1D", choices=["1D", "five_minute"])
     parser.add_argument("--spans", type=int, nargs="+", default=[20, 60, 120], help="回溯天数列表，如: 20 60 120")
-    parser.add_argument("--data", type=str, default="v0v3", choices=["v0v3"],
+    parser.add_argument("--data", type=str, default="v0v3", choices=["v0v3", "v0v2"],
                         help="数据集版本：v0v3（双概念对齐数据）")
     parser.add_argument("--hidden_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)

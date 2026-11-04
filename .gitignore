@@ -3,7 +3,9 @@ _logs/
 _result/
 data/
 model_configs/
+model_configs_GCL/
 model_outputs/
+model_outputs_GCL/
 VPureETE2_r5/
 
 # Python cache
@@ -14,3 +16,10 @@ __pycache__/
 # factor data
 VCAT_1D_LAG20_60_120_r5_LGBM/
 VCAT_five_minute_LAG20_60_120_r5_LGBM/
+
+# experiment results
+FactorGCLAblationBatch2_*/
+
+# logs and outputs
+*.log
+training_log_analysis.pdf
