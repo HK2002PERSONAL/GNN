@@ -8,7 +8,8 @@
 支持的边版本：2, 3, 7, 9, 10, 12, 14
 
 对齐方式：
-    节点 = 特征 ∩ 标签 ∩ (有行业且有市值) ∩ edges_v{n1} 涉及股票 ∩ edges_v{n2} 涉及股票
+    训练/验证集节点 = 特征 ∩ 标签 ∩ (有行业且有市值) ∩ edges_v{n1} 涉及股票 ∩ edges_v{n2} 涉及股票
+    测试集节点 = 特征 ∩ (有行业且有市值) ∩ edges_v{n1} 涉及股票 ∩ edges_v{n2} 涉及股票（不依赖标签）
     每日独立编码：
         industry_v0   : 行业整数编码（训练时 one-hot 成概念矩阵）
         industry_v{n1}: 第二边连通分量标签（训练时 one-hot 成概念矩阵）
@@ -26,9 +27,12 @@
     y              [N]    标签（test 集为股票代码）
     date           [3]    年/月/日
 
-运行：python DataBuilder/hist_data_builder/build_GCN_GCN_GCN_data.py --edge-version-2 2 --edge-version-3 3 --freq 1D --lags 20 60 120
+运行：python DataBuilder/hist_data_builder/build_GCN_GCN_GCN_data.py --edge-version-2 2 --edge-version-3 3 --freq 1D --lags 20 60 120 --label data/label/stock_ret.pqt --horizon 5d
 特征文件：data/feature/CAT_{freq}_LAG{lag1}_{lag2}_..._.pqt
-保存：data/hist_{freq}_lag{lag1}_{lag2}_..._v0v{n1}v{n2}/{train,valid,test}.pt
+标签文件：data/label/*.pqt（parquet 格式，通过 --label 参数指定，默认 data/label/stock_ret.pqt）
+标签长度：通过 --horizon 参数指定，可选 5d（Return5d）或 20d（Return20d），默认 5d
+保存：data/hist_{freq}_lag{lag1}_{lag2}_..._v0v{n1}v{n2}_{label_name}_{horizon}/{train,valid,test}.pt
+      其中 label_name 为标签文件名（不含扩展名），如 stock_ret、spec_ret；horizon 为标签长度，如 5d、20d
 """
 import argparse
 import os
@@ -37,6 +41,7 @@ from time import time
 import pandas as pd
 import numpy as np
 import torch
+import duckdb
 from joblib import Parallel, delayed
 from torch.utils.data import Dataset, DataLoader
 
@@ -49,6 +54,14 @@ SUPPORTED_EDGE_VERSIONS = [2, 3, 7, 9, 10, 12, 14]
 # 支持的特征频率
 SUPPORTED_FREQS = ["1D", "five_minute"]
 
+# 默认标签路径
+DEFAULT_LABEL_PATH = "data/label/stock_ret.pqt"
+
+# 支持的标签长度（horizon）
+SUPPORTED_HORIZONS = ["5d", "20d"]
+HORIZON_TO_LABEL_MARK = {"5d": "Return5d", "20d": "Return20d"}
+DEFAULT_HORIZON = "5d"
+
 # 全局路径（由 parse_args 设置）
 FEATURE_PATH = None
 SAVE_DIR = None
@@ -56,6 +69,8 @@ EDGE_DIR_2 = None
 EDGE_DIR_3 = None
 EDGE_VERSION_2 = None
 EDGE_VERSION_3 = None
+LABEL_PATH = None
+LABEL_MARK = None
 
 
 def build_feature_path(freq: str, lags: list) -> str:
@@ -64,28 +79,28 @@ def build_feature_path(freq: str, lags: list) -> str:
     return f"data/feature/CAT_{freq}_LAG{lag_str}.pqt"
 
 
-def build_save_dir(freq: str, lags: list, edge_version_2: int, edge_version_3: int) -> str:
-    """按命名标准拼接保存目录：data/hist_{freq}_lag{lag1}_{lag2}_..._v0v{edge_version_2}v{edge_version_3}"""
+def build_save_dir(freq: str, lags: list, edge_version_2: int, edge_version_3: int, label_name: str, horizon: str) -> str:
+    """按命名标准拼接保存目录：data/hist_{freq}_lag{lag1}_{lag2}_..._v0v{edge_version_2}v{edge_version_3}_{label_name}_{horizon}"""
     lag_str = "_".join(str(x) for x in lags)
-    return f"data/hist_{freq}_lag{lag_str}_v0v{edge_version_2}v{edge_version_3}"
+    return f"data/hist_{freq}_lag{lag_str}_v0v{edge_version_2}v{edge_version_3}_{label_name}_{horizon}"
 
 
 def parse_args():
     """解析命令行参数，设置全局路径。"""
-    global FEATURE_PATH, SAVE_DIR, EDGE_DIR_2, EDGE_DIR_3, EDGE_VERSION_2, EDGE_VERSION_3  # pylint:disable=W0603
+    global FEATURE_PATH, SAVE_DIR, EDGE_DIR_2, EDGE_DIR_3, EDGE_VERSION_2, EDGE_VERSION_3, LABEL_PATH, LABEL_MARK  # pylint:disable=W0603
 
     parser = argparse.ArgumentParser(description="构建三概念每日截面数据（v0 + v{n1} + v{n2}）")
     parser.add_argument(
         "--edge-version-2", "-v2",
         type=int,
-        required=True,
+        default=14,
         choices=SUPPORTED_EDGE_VERSIONS,
         help=f"第二边的版本号，可选：{SUPPORTED_EDGE_VERSIONS}"
     )
     parser.add_argument(
         "--edge-version-3", "-v3",
         type=int,
-        required=True,
+        default=2,
         choices=SUPPORTED_EDGE_VERSIONS,
         help=f"第三边的版本号，可选：{SUPPORTED_EDGE_VERSIONS}"
     )
@@ -103,17 +118,44 @@ def parse_args():
         default=[20, 60, 120],
         help="回看周期列表，如 --lags 20 60 120，默认 20 60 120"
     )
+    parser.add_argument(
+        "--label",
+        type=str,
+        default=DEFAULT_LABEL_PATH,
+        help=f"标签文件路径（.pqt 格式），默认 {DEFAULT_LABEL_PATH}"
+    )
+    parser.add_argument(
+        "--horizon", "-hz",
+        type=str,
+        default=DEFAULT_HORIZON,
+        choices=SUPPORTED_HORIZONS,
+        help=f"标签长度，可选：{SUPPORTED_HORIZONS}（分别对应 Return5d / Return20d），默认 {DEFAULT_HORIZON}"
+    )
     _args = parser.parse_args()
 
     if _args.edge_version_2 == _args.edge_version_3:
         raise ValueError(f"第二边和第三边版本不能相同: v{_args.edge_version_2}")
+
+    # 设置标签路径并校验
+    label_path = _args.label
+    if not label_path.endswith(".pqt"):
+        raise ValueError(f"标签文件必须为 .pqt 格式: {label_path}")
+    if not os.path.isfile(label_path):
+        raise FileNotFoundError(f"标签文件不存在: {label_path}")
+    LABEL_PATH = label_path
+
+    # 提取标签文件名（不含扩展名）用于保存目录命名
+    label_name = os.path.splitext(os.path.basename(label_path))[0]
+
+    # 设置标签列名（Return5d 或 Return20d）
+    LABEL_MARK = HORIZON_TO_LABEL_MARK[_args.horizon]
 
     EDGE_VERSION_2 = _args.edge_version_2
     EDGE_VERSION_3 = _args.edge_version_3
     EDGE_DIR_2 = f"data/edges/edges_v{EDGE_VERSION_2}"
     EDGE_DIR_3 = f"data/edges/edges_v{EDGE_VERSION_3}"
     FEATURE_PATH = build_feature_path(_args.freq, _args.lags)
-    SAVE_DIR = build_save_dir(_args.freq, _args.lags, _args.edge_version_2, _args.edge_version_3)
+    SAVE_DIR = build_save_dir(_args.freq, _args.lags, _args.edge_version_2, _args.edge_version_3, label_name, _args.horizon)
 
     # 检查边目录是否存在
     if not os.path.isdir(EDGE_DIR_2):
@@ -187,22 +229,94 @@ def remap_and_components(ei_np: np.ndarray, codes_str: np.ndarray, nodes: pd.Ind
     return find_connected_components(edge_index_np, len(nodes))
 
 
+class ParquetDayReader:
+    def __init__(self):
+        self.con = duckdb.connect()
+        # 并行只交给 joblib，避免每个 worker 内 DuckDB 再开很多线程
+        self.con.execute("PRAGMA threads=1")
+
+    def read_day(
+        self,
+        parquet_path: str,
+        day: str,
+        columns: list[str] | None = None,
+    ) -> pd.DataFrame:
+        cols = "*" if columns is None else ", ".join(
+            f'"{col}"' for col in columns
+        )
+
+        return self.con.execute(
+            f"""
+            SELECT {cols}
+            FROM read_parquet(?)
+            WHERE DataDate = ?
+            """,
+            [parquet_path, pd.Timestamp(day)],
+        ).df()
+
+
+# 进程级缓存：loky 的每个 worker 都有各自独立的全局变量
+_WORKER_READER = None
+
+
+def get_worker_reader() -> ParquetDayReader:
+    global _WORKER_READER #pylint:disable=W0603
+
+    if _WORKER_READER is None:
+        _WORKER_READER = ParquetDayReader()
+
+    return _WORKER_READER
+
 def get_day_data(
     day: str,
-    label_mark: str = 'Return5d',
+    label_mark: str | None = None,
     test_set: bool = False
 ) -> dict:
 
-    ft_day = pd.read_parquet(
-        path=FEATURE_PATH,
-        filters=[("DataDate", "==", pd.to_datetime(day))]
-    ).droplevel(0)
+    if label_mark is None:
+        label_mark = LABEL_MARK if LABEL_MARK is not None else HORIZON_TO_LABEL_MARK[DEFAULT_HORIZON]
 
-    lb_day = pd.read_parquet(
-        path="data/label/stock_ret.pqt",
-        columns=[label_mark],
-        filters=[("DataDate", "==", pd.to_datetime(day))]
-    ).droplevel(0)
+    # ft_day = pd.read_parquet(
+    #     path=FEATURE_PATH,
+    #     filters=[("DataDate", "==", pd.to_datetime(day))]
+    # ).droplevel(0)
+
+    # # 测试集不读取标签，不用标签对齐
+    # if not test_set:
+    #     lb_day = pd.read_parquet(
+    #         path=LABEL_PATH,
+    #         columns=[label_mark],
+    #         filters=[("DataDate", "==", pd.to_datetime(day))]
+    #     ).droplevel(0)
+    # else:
+    #     lb_day = None
+
+    reader = get_worker_reader()
+
+    ft_day = reader.read_day(FEATURE_PATH, day)
+    if ft_day.empty:
+        return None
+
+    ft_day = (
+        ft_day.drop(columns=["DataDate"])
+        .set_index("SecuCode")
+    )
+
+    if not test_set:
+        lb_day = reader.read_day(
+            LABEL_PATH,
+            day,
+            columns=["DataDate", "SecuCode", label_mark],
+        )
+        if lb_day.empty:
+            return None
+
+        lb_day = (
+            lb_day.drop(columns=["DataDate"])
+            .set_index("SecuCode")
+        )
+    else:
+        lb_day = None
 
     # v0：行业 + 市值
     edge_day = pd.read_parquet(
@@ -226,10 +340,16 @@ def get_day_data(
         return None
     ei_v3, codes_v3 = v3
 
-    avail_idx = ft_day.index.intersection(lb_day.index)
     edge_day = edge_day[edge_day["IndustryCodeNew"].notna() & edge_day["FloatMarketCap"].notna()]
 
-    # 对齐：特征 ∩ 标签 ∩ (行业+市值) ∩ v{n1} 节点 ∩ v{n2} 节点
+    # 对齐：
+    #   训练/验证集：特征 ∩ 标签 ∩ (行业+市值) ∩ v{n1} 节点 ∩ v{n2} 节点
+    #   测试集：特征 ∩ (行业+市值) ∩ v{n1} 节点 ∩ v{n2} 节点（不用标签对齐）
+    if not test_set:
+        avail_idx = ft_day.index.intersection(lb_day.index)
+    else:
+        avail_idx = ft_day.index
+
     nodes = (avail_idx
              .intersection(edge_day.index)
              .intersection(pd.Index(codes_v2))
@@ -239,7 +359,8 @@ def get_day_data(
 
     nodes = nodes.sort_values()
     ft_day = ft_day.loc[nodes]
-    lb_day = lb_day.loc[nodes]
+    if not test_set:
+        lb_day = lb_day.loc[nodes]
     edge_day = edge_day.loc[nodes]
 
     # v0 概念：行业整数编码（每日独立）
@@ -254,9 +375,10 @@ def get_day_data(
     industry_v2_t = torch.tensor(industry_v2, dtype=torch.long)
     industry_v3_t = torch.tensor(industry_v3, dtype=torch.long)
     market_value = torch.tensor(edge_day["FloatMarketCap"].values, dtype=torch.float)
-    y = torch.tensor(
-        lb_day[label_mark].values if not test_set else nodes.values.astype(int),
-        dtype=torch.float)
+    if not test_set:
+        y = torch.tensor(lb_day[label_mark].values, dtype=torch.float)
+    else:
+        y = torch.tensor(nodes.values.astype(int), dtype=torch.float)
 
     return {
         "x": x,
@@ -274,11 +396,19 @@ def get_avail_days_and_split(
     valid_start: str, valid_end: str,
     test_start: str
 ):
+    """获取可用交易日并划分训练/验证/测试集。
+
+    训练/验证集日期：特征 ∩ 边 ∩ 标签（需要标签）
+    测试集日期：特征 ∩ 边（不依赖标签）
+    """
     ft_days = pd.read_parquet(path=FEATURE_PATH, columns=[]).index.get_level_values('DataDate').unique()
     edge_days = pd.read_parquet(path=EDGE_PATH, columns=["DataDate"])["DataDate"].unique()
-    lb_days = pd.read_parquet(path="data/label/stock_ret.pqt", columns=[]).index.get_level_values('DataDate').unique()
+    lb_days = pd.read_parquet(path=LABEL_PATH, columns=[]).index.get_level_values('DataDate').unique()
 
-    days = ft_days.intersection(pd.DatetimeIndex(edge_days)).intersection(lb_days)
+    # 训练/验证集日期：需要与标签对齐
+    days_with_label = ft_days.intersection(pd.DatetimeIndex(edge_days)).intersection(lb_days)
+    # 测试集日期：不依赖标签
+    days_all = ft_days.intersection(pd.DatetimeIndex(edge_days))
 
     train_start = pd.Timestamp(train_start)
     train_end = pd.Timestamp(train_end)
@@ -287,15 +417,15 @@ def get_avail_days_and_split(
     test_start = pd.Timestamp(test_start)
 
     splits = {
-        "train": days[(days >= train_start) & (days <= train_end)],
-        "valid": days[(days >= valid_start) & (days <= valid_end)],
-        "test": days[days >= test_start]
+        "train": days_with_label[(days_with_label >= train_start) & (days_with_label <= train_end)],
+        "valid": days_with_label[(days_with_label >= valid_start) & (days_with_label <= valid_end)],
+        "test": days_all[days_all >= test_start]
     }
 
     return splits
 
 
-def build_and_save_split(split_name, days, label_mark="Return5d", n_jobs=32):
+def build_and_save_split(split_name, days, label_mark: str | None = None, n_jobs=32):
     """并行生成每个交易日的三概念截面数据，按日期顺序保存为单个 .pt 文件。
 
     保存格式：{"days": [int, ...], "data_list": [dict, ...]}
@@ -306,7 +436,9 @@ def build_and_save_split(split_name, days, label_mark="Return5d", n_jobs=32):
     day_ints = (days.year * 10000 + days.month * 100 + days.day).tolist()
 
     test_set = (split_name == "test")
-    print(f"[{split_name}] 交易日数量: {len(day_strs)}，并行生成中 ...")
+    if label_mark is None:
+        label_mark = LABEL_MARK if LABEL_MARK is not None else HORIZON_TO_LABEL_MARK[DEFAULT_HORIZON]
+    print(f"[{split_name}] 交易日数量: {len(day_strs)}，标签列: {label_mark}，并行生成中 ...")
     data_list = Parallel(n_jobs=n_jobs, backend="loky", verbose=10)(
         delayed(get_day_data)(d, label_mark, test_set) for d in day_strs
     )
@@ -362,6 +494,7 @@ if __name__ == "__main__":
     print(f"固定边: v0(行业) | 第二边: v{args.edge_version_2} | 第三边: v{args.edge_version_3}")
     print(f"EDGE_DIR_2={EDGE_DIR_2}, EDGE_DIR_3={EDGE_DIR_3}")
     print(f"特征: freq={args.freq} lags={args.lags} | FEATURE_PATH={FEATURE_PATH}")
+    print(f"标签: LABEL_PATH={LABEL_PATH} | 标签列: {LABEL_MARK} (horizon={args.horizon})")
     print(f"保存目录: {SAVE_DIR}")
 
     start = time()

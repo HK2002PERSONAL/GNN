@@ -12,18 +12,21 @@ T[II] 版本与原版 FactorGCL 的区别：
     - 不再计算完整的 B×B 相似度矩阵
     - 损失为 -mean(cos_sim(pre_i, fut_i))
 
-模型 HIST_FactorGCL_T 用三个 GCN_InfoShare_block 串联 + 未来特征对比学习（TRCL-PosOnly）：
+模型 HIST_FactorGCL_V2 用三个 GCN_InfoShare_block 串联 + 未来特征对比学习（TRCL-PosOnly）：
     概念 1 (v0)  : 一级行业 —— IndustryCodeNew（固定）
     概念 2 (v{n1}): 第二版边连通分量（开放选择）
     概念 3 (v{n2}): 第三版边连通分量（开放选择）
 
 数据由 DataBuilder/hist_data_builder/build_FactorGCL_data.py 产出：
-    data/hist_{freq}_lag{lags}_v0v{n1}v{n2}_fut5/{train,valid,test}.pt
+    data/hist_{freq}_lag{lags}_v0v{n1}v{n2}_{label_name}_{horizon}_fut{fut_shift}/{train,valid,test}.pt
+    其中 label_name 为标签文件名（不含扩展名），如 stock_ret、spec_ret（默认 stock_ret）
+    horizon 为标签长度，可选 5d（Return5d）或 20d（Return20d），默认 5d
+    fut_shift 为未来特征偏移，随 horizon 变化：5d→fut5，20d→fut20
 
     样本字段：
         训练/验证集：
             x              [N, F] 特征
-            x_fut          [N, F] 未来 5 交易日特征（供对比学习）
+            x_fut          [N, F] 未来 fut_shift 交易日特征（供对比学习，随 horizon 变化：5d→5，20d→20）
             industry_v0    [N]    行业整数编码（概念 1）
             industry_v{n1} [N]    第二边连通分量标签（概念 2）
             industry_v{n2} [N]    第三边连通分量标签（概念 3）
@@ -48,8 +51,8 @@ T[II] 版本与原版 FactorGCL 的区别：
     python HIST_models/run_FactorGCL_T[II].py --edge-version-2 2 --edge-version-3 3
     python HIST_models/run_FactorGCL_T[II].py -v2 2 -v3 3 --hidden_size 64 --clip 0.04 --gamma 0.1
 
-输出：model_configs/FactorGCL_T[II]g[{gamma}]_{data_version}_{clip_mark}{ew_mark}_LossLog/
-      model_outputs/FactorGCL_T[II]g[{gamma}]_{data_version}_{clip_mark}{ew_mark}_LossLog.pqt
+输出：model_configs/best_hist_a11_T[II]g[{gamma}]_{data_version}_{clip_mark}{ew_mark}_LossLog/
+      model_outputs/hist_test_a11_T[II]g[{gamma}]_{data_version}_{clip_mark}{ew_mark}_LossLog.pqt
 """
 import argparse
 import sys
@@ -65,7 +68,9 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from models import HIST_FactorGCL_T
+import os
+
+from models import HIST_FactorGCL_V2
 from data_utils import get_dataloader
 from utils.Logger import smart_log, make_log_file
 from utils.SeedManager import seed_all_non_torch, seed_torch_all
@@ -74,8 +79,12 @@ from utils.ModelUtils import z_score
 root_seed = 10086
 torch_seed_range = range(root_seed, root_seed + 10, 4)
 
-# 未来特征偏移（与 build_FactorGCL_data.py 保持一致）
-FUT_SHIFT = 5
+# 支持的标签长度（horizon），与 build_FactorGCL_data.py 保持一致
+SUPPORTED_HORIZONS = ["5d", "20d"]
+DEFAULT_HORIZON = "5d"
+
+# 未来特征偏移（交易日数）随标签长度变化：5d→5，20d→20（与 build_FactorGCL_data.py 保持一致）
+HORIZON_TO_FUT_SHIFT = {"5d": 5, "20d": 20}
 
 
 # ---------------- 概念 -> 概念矩阵 ----------------
@@ -166,10 +175,14 @@ class TRCL_Loss(nn.Module):
 # ---------------- 前向 ----------------
 
 def model_forward_train(_model, _sample, _device, _edge_v2: int, _edge_v3: int):
-    """训练模式：output=False，返回 (pred, real_indi_info, goof_indi_info)。
+    """训练模式：返回 (pred, real_indi_info, goof_indi_info)。
 
     概念 1 = v0 行业（固定），概念 2 = v{edge_v2}，概念 3 = v{edge_v3}。
     需要 x_fut（测试集不含该键，故仅训练/验证集调用）。
+    
+    HIST_FactorGCL_V2:
+        forward(x, concept_1, concept_2, concept_3, market_value) -> (pred, i_info_fore)
+        goof_forward(x_fut, concept_1, concept_2, concept_3, market_value) -> fut_i_info_fore
     """
     x = _sample["x"].to(_device)
     x_fut = _sample["x_fut"].to(_device)
@@ -180,12 +193,15 @@ def model_forward_train(_model, _sample, _device, _edge_v2: int, _edge_v3: int):
     concept_1 = industry_to_concept(industry_v0)
     concept_2 = industry_to_concept(industry_v2)
     concept_3 = industry_to_concept(industry_v3)
-    # output=False -> (batch_result, real_indi_info, goof_indi_info)
-    return _model(concept_1, concept_2, concept_3, market_value, x, x_fut=x_fut, output=False)
+    # forward -> (pred, i_info_fore)
+    pred, real_indi_info = _model(x, concept_1, concept_2, concept_3, market_value)
+    # goof_forward -> fut_i_info_fore (with torch.no_grad())
+    goof_indi_info = _model.goof_forward(x_fut, concept_1, concept_2, concept_3, market_value)
+    return pred, real_indi_info, goof_indi_info
 
 
 def model_forward_eval(_model, _sample, _device, _edge_v2: int, _edge_v3: int):
-    """推理模式：output=True，返回预测值 [N, 1]。测试集无 x_fut，使用 output=True。"""
+    """推理模式：返回预测值 [N, 1]。测试集无 x_fut。"""
     x = _sample["x"].to(_device)
     industry_v0 = _sample["industry_v0"].to(_device)
     industry_v2 = _sample[f"industry_v{_edge_v2}"].to(_device)
@@ -194,8 +210,9 @@ def model_forward_eval(_model, _sample, _device, _edge_v2: int, _edge_v3: int):
     concept_1 = industry_to_concept(industry_v0)
     concept_2 = industry_to_concept(industry_v2)
     concept_3 = industry_to_concept(industry_v3)
-    # output=True -> batch_result only
-    return _model(concept_1, concept_2, concept_3, market_value, x, output=True)
+    # forward -> (pred, i_info_fore)，只取 pred
+    pred, _ = _model(x, concept_1, concept_2, concept_3, market_value)
+    return pred
 
 
 # ---------------- 训练 ----------------
@@ -328,12 +345,16 @@ def parse_args():
                         help="第二层是否使用 edge_weight，1=使用（默认），0=不使用")
     parser.add_argument("--ew3", type=int, default=1, choices=[0, 1],
                         help="第三层是否使用 edge_weight，1=使用（默认），0=不使用")
+    parser.add_argument("--label", type=str, default="data/label/stock_ret.pqt",
+                        help="标签文件路径（.pqt 格式），默认 data/label/stock_ret.pqt")
+    parser.add_argument("--horizon", "-hz", type=str, default=DEFAULT_HORIZON, choices=SUPPORTED_HORIZONS,
+                        help=f"标签长度，可选：{SUPPORTED_HORIZONS}（分别对应 Return5d / Return20d），默认 {DEFAULT_HORIZON}")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    model_id = f"FactorGCL_T[II]g[{args.gamma}]"
+    model_id = f"a11_T[II]g[{args.gamma}]"
 
     # 校验：第二边和第三边版本不能相同
     if args.edge_version_2 == args.edge_version_3:
@@ -345,10 +366,18 @@ if __name__ == "__main__":
     else:
         clip_mark = f"c{clip:.1f}"
 
-    # 数据版本：{freq}_lag{spans}_v0v{edge_v2}v{edge_v3}_fut{FUT_SHIFT}
+    # 标签文件校验与提取标签名
+    if not args.label.endswith(".pqt"):
+        raise ValueError(f"标签文件必须为 .pqt 格式: {args.label}")
+    label_name = os.path.splitext(os.path.basename(args.label))[0]
+
+    # 未来特征偏移随标签长度变化：5d→5，20d→20
+    fut_shift = HORIZON_TO_FUT_SHIFT[args.horizon]
+
+    # 数据版本：{freq}_lag{spans}_v0v{edge_v2}v{edge_v3}_{label_name}_{horizon}_fut{fut_shift}
     data_version = (
         f"{args.freq}_lag{'_'.join([str(span) for span in args.spans])}"
-        f"_v0v{args.edge_version_2}v{args.edge_version_3}_fut{FUT_SHIFT}"
+        f"_v0v{args.edge_version_2}v{args.edge_version_3}_{label_name}_{args.horizon}_fut{fut_shift}"
     )
 
     ew1 = bool(args.ew1)
@@ -363,15 +392,16 @@ if __name__ == "__main__":
         ew_mark += ('_' if ew_mark else '') + 'ew3[off]'
 
     # 添加 LossLog 标识
-    exp_name = f"{model_id}_{data_version}_{clip_mark}{'_' + ew_mark if ew_mark else ''}_LossLog"
-    ckpt_path = f"model_configs_GCL/{exp_name}"
-    out_path = f"model_outputs_GCL/{exp_name}.pqt"
+    exp_name = f"hist_{model_id}_{data_version}_{clip_mark}{'_' + ew_mark if ew_mark else ''}_LossLog"
+    ckpt_path = f"model_configs/best_{exp_name}"
+    out_path = f"model_outputs/hist_test_{model_id}_{data_version}_{clip_mark}{'_' + ew_mark if ew_mark else ''}_LossLog.pqt"
 
     make_log_file()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     smart_log(f"device = {device}")
     smart_log(f"model = HIST_{model_id} | data = {data_version} | hidden_size = {args.hidden_size}")
     smart_log(f"gamma = {args.gamma} | ew1 = {ew1} | ew2 = {ew2} | ew3 = {ew3}")
+    smart_log(f"label = {args.label} | horizon = {args.horizon} | fut_shift = {fut_shift}")
     smart_log("LossLog 模式（T[II]）：每 epoch 记录训练集总损失、验证集 IC/ICIR、IC loss 与 Temporal PosOnly 梯度范数均值")
 
     seed_all_non_torch(root_seed)
@@ -402,7 +432,7 @@ if __name__ == "__main__":
         smart_log(f"training {torch_seed}")
         seed_torch_all(torch_seed)
 
-        model = HIST_FactorGCL_T(
+        model = HIST_FactorGCL_V2(
             d_feat=d_feat, hidden_size=args.hidden_size,
             clip=clip, ew1=ew1, ew2=ew2, ew3=ew3
         ).to(device)
@@ -434,7 +464,7 @@ if __name__ == "__main__":
                     break
 
     modelS = {
-        iter_seed: HIST_FactorGCL_T(
+        iter_seed: HIST_FactorGCL_V2(
             d_feat=d_feat, hidden_size=args.hidden_size,
             clip=clip, ew1=ew1, ew2=ew2, ew3=ew3
         ).to(device)

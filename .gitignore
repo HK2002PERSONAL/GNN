@@ -5,6 +5,7 @@ data/
 model_configs/
 model_configs_GCL/
 model_outputs/
+model_features/
 model_outputs_GCL/
 VPureETE2_r5/
 

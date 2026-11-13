@@ -4,12 +4,13 @@
     concept 1 : v0    —— 一级行业（IndustryCodeNew，来自 data/raw_data/stock_edge.pqt）【固定】
     concept 2 : v{n1} —— 可选边版本（data/edges/edges_v{n1}/{day_int}.npz）的连通分量【可选】
     concept 3 : v{n2} —— 可选边版本（data/edges/edges_v{n2}/{day_int}.npz）的连通分量【可选】
-    x_fut     : 当日特征之后第 5 个交易日（FUT_SHIFT）的特征，仅训练/验证集提供
+    x_fut     : 当日特征之后第 FUT_SHIFT 个交易日的特征（随 --horizon 变化：5d→5，20d→20），仅训练/验证集提供
 
 支持的边版本：2, 3, 7, 9, 10, 12, 14
 
 对齐方式：
-    节点 = 特征 ∩ 标签 ∩ (有行业且有市值) ∩ edges_v{n1} 涉及股票 ∩ edges_v{n2} 涉及股票
+    训练/验证集节点 = 特征 ∩ 标签 ∩ (有行业且有市值) ∩ edges_v{n1} 涉及股票 ∩ edges_v{n2} 涉及股票
+    测试集节点 = 特征 ∩ (有行业且有市值) ∩ edges_v{n1} 涉及股票 ∩ edges_v{n2} 涉及股票（不依赖标签）
     训练/验证集额外要求：节点 ∈ 未来日特征（保证 x_fut 对齐）
     每日独立编码：
         industry_v0   : 行业整数编码（训练时 one-hot 成概念矩阵）
@@ -30,7 +31,7 @@
         industry_v{n1} [N]    第二边连通分量标签（concept 2，可选）
         industry_v{n2} [N]    第三边连通分量标签（concept 3，可选）
         market_value   [N]    流通市值
-        y              [N]    标签（Return5d）
+        y              [N]    标签（Return5d 或 Return20d）
         date           [3]    年/月/日
 
     测试集（无 x_fut）：
@@ -42,9 +43,13 @@
         y              [N]    股票代码（方便导出预测值）
         date           [3]    年/月/日
 
-运行：python DataBuilder/hist_data_builder/build_FactorGCL_data.py --edge-version-2 2 --edge-version-3 3 --freq 1D --lags 20 60 120
+运行：python DataBuilder/hist_data_builder/build_FactorGCL_data.py --edge-version-2 2 --edge-version-3 3 --freq 1D --lags 20 60 120 --label data/label/stock_ret.pqt --horizon 5d
 特征文件：data/feature/CAT_{freq}_LAG{lag1}_{lag2}_..._.pqt
-保存：data/hist_{freq}_lag{lag1}_{lag2}_..._v0v{n1}v{n2}_fut5/{train,valid,test}.pt
+标签文件：data/label/*.pqt（parquet 格式，通过 --label 参数指定，默认 data/label/stock_ret.pqt）
+标签长度：通过 --horizon 参数指定，可选 5d（Return5d）或 20d（Return20d），默认 5d
+保存：data/hist_{freq}_lag{lag1}_{lag2}_..._v0v{n1}v{n2}_{label_name}_{horizon}_fut{fut_shift}/{train,valid,test}.pt
+      其中 label_name 为标签文件名（不含扩展名），如 stock_ret、spec_ret；horizon 为标签长度，如 5d、20d
+      fut_shift 为未来特征偏移（随 horizon 变化：5d→fut5，20d→fut20）
 """
 import argparse
 import os
@@ -65,16 +70,27 @@ SUPPORTED_EDGE_VERSIONS = [2, 3, 7, 9, 10, 12, 14]
 # 支持的特征频率
 SUPPORTED_FREQS = ["1D", "five_minute"]
 
-# 未来特征偏移（交易日数）
-FUT_SHIFT = 5
+# 默认标签路径
+DEFAULT_LABEL_PATH = "data/label/stock_ret.pqt"
 
-# 全局路径（由 parse_args 设置）
+# 支持的标签长度（horizon）
+SUPPORTED_HORIZONS = ["5d", "20d"]
+HORIZON_TO_LABEL_MARK = {"5d": "Return5d", "20d": "Return20d"}
+DEFAULT_HORIZON = "5d"
+
+# 未来特征偏移（交易日数）随标签长度变化：5d→5，20d→20
+HORIZON_TO_FUT_SHIFT = {"5d": 5, "20d": 20}
+
+# 全局路径与参数（由 parse_args 设置）
 FEATURE_PATH = None
 SAVE_DIR = None
 EDGE_DIR_2 = None
 EDGE_DIR_3 = None
 EDGE_VERSION_2 = None
 EDGE_VERSION_3 = None
+LABEL_PATH = None
+LABEL_MARK = None
+FUT_SHIFT = HORIZON_TO_FUT_SHIFT[DEFAULT_HORIZON]
 
 
 def build_feature_path(freq: str, lags: list) -> str:
@@ -83,15 +99,15 @@ def build_feature_path(freq: str, lags: list) -> str:
     return f"data/feature/CAT_{freq}_LAG{lag_str}.pqt"
 
 
-def build_save_dir(freq: str, lags: list, edge_version_2: int, edge_version_3: int) -> str:
-    """按命名标准拼接保存目录：data/hist_{freq}_lag{lag1}_{lag2}_..._v0v{n1}v{n2}_fut{FUT_SHIFT}"""
+def build_save_dir(freq: str, lags: list, edge_version_2: int, edge_version_3: int, label_name: str, horizon: str, fut_shift: int) -> str:
+    """按命名标准拼接保存目录：data/hist_{freq}_lag{lag1}_{lag2}_..._v0v{n1}v{n2}_{label_name}_{horizon}_fut{fut_shift}"""
     lag_str = "_".join(str(x) for x in lags)
-    return f"data/hist_{freq}_lag{lag_str}_v0v{edge_version_2}v{edge_version_3}_fut{FUT_SHIFT}"
+    return f"data/hist_{freq}_lag{lag_str}_v0v{edge_version_2}v{edge_version_3}_{label_name}_{horizon}_fut{fut_shift}"
 
 
 def parse_args():
     """解析命令行参数，设置全局路径。"""
-    global FEATURE_PATH, SAVE_DIR, EDGE_DIR_2, EDGE_DIR_3, EDGE_VERSION_2, EDGE_VERSION_3  # pylint:disable=W0603
+    global FEATURE_PATH, SAVE_DIR, EDGE_DIR_2, EDGE_DIR_3, EDGE_VERSION_2, EDGE_VERSION_3, LABEL_PATH, LABEL_MARK, FUT_SHIFT  # pylint:disable=W0603
 
     parser = argparse.ArgumentParser(
         description=f"构建三概念 + 未来特征每日截面数据（v0 + v{{n1}} + v{{n2}} + fut{FUT_SHIFT}）")
@@ -123,17 +139,47 @@ def parse_args():
         default=[20, 60, 120],
         help="回看周期列表，如 --lags 20 60 120，默认 20 60 120"
     )
+    parser.add_argument(
+        "--label",
+        type=str,
+        default=DEFAULT_LABEL_PATH,
+        help=f"标签文件路径（.pqt 格式），默认 {DEFAULT_LABEL_PATH}"
+    )
+    parser.add_argument(
+        "--horizon", "-hz",
+        type=str,
+        default=DEFAULT_HORIZON,
+        choices=SUPPORTED_HORIZONS,
+        help=f"标签长度，可选：{SUPPORTED_HORIZONS}（分别对应 Return5d / Return20d），默认 {DEFAULT_HORIZON}"
+    )
     _args = parser.parse_args()
 
     if _args.edge_version_2 == _args.edge_version_3:
         raise ValueError(f"第二边和第三边版本不能相同: v{_args.edge_version_2}")
+
+    # 设置标签路径并校验
+    label_path = _args.label
+    if not label_path.endswith(".pqt"):
+        raise ValueError(f"标签文件必须为 .pqt 格式: {label_path}")
+    if not os.path.isfile(label_path):
+        raise FileNotFoundError(f"标签文件不存在: {label_path}")
+    LABEL_PATH = label_path
+
+    # 提取标签文件名（不含扩展名）用于保存目录命名
+    label_name = os.path.splitext(os.path.basename(label_path))[0]
+
+    # 设置标签列名（Return5d 或 Return20d）
+    LABEL_MARK = HORIZON_TO_LABEL_MARK[_args.horizon]
+
+    # 设置未来特征偏移（随标签长度变化：5d→5，20d→20）
+    FUT_SHIFT = HORIZON_TO_FUT_SHIFT[_args.horizon]
 
     EDGE_VERSION_2 = _args.edge_version_2
     EDGE_VERSION_3 = _args.edge_version_3
     EDGE_DIR_2 = f"data/edges/edges_v{EDGE_VERSION_2}"
     EDGE_DIR_3 = f"data/edges/edges_v{EDGE_VERSION_3}"
     FEATURE_PATH = build_feature_path(_args.freq, _args.lags)
-    SAVE_DIR = build_save_dir(_args.freq, _args.lags, _args.edge_version_2, _args.edge_version_3)
+    SAVE_DIR = build_save_dir(_args.freq, _args.lags, _args.edge_version_2, _args.edge_version_3, label_name, _args.horizon, FUT_SHIFT)
 
     # 检查边目录是否存在
     if not os.path.isdir(EDGE_DIR_2):
@@ -210,20 +256,27 @@ def remap_and_components(ei_np: np.ndarray, codes_str: np.ndarray, nodes: pd.Ind
 def get_day_data(
     day: str,
     fut_day: str = None,
-    label_mark: str = 'Return5d',
+    label_mark: str | None = None,
     test_set: bool = False
 ) -> dict:
+
+    if label_mark is None:
+        label_mark = LABEL_MARK if LABEL_MARK is not None else HORIZON_TO_LABEL_MARK[DEFAULT_HORIZON]
 
     ft_day = pd.read_parquet(
         path=FEATURE_PATH,
         filters=[("DataDate", "==", pd.to_datetime(day))]
     ).droplevel(0)
 
-    lb_day = pd.read_parquet(
-        path="data/label/stock_ret.pqt",
-        columns=[label_mark],
-        filters=[("DataDate", "==", pd.to_datetime(day))]
-    ).droplevel(0)
+    # 测试集不读取标签，不用标签对齐
+    if not test_set:
+        lb_day = pd.read_parquet(
+            path=LABEL_PATH,
+            columns=[label_mark],
+            filters=[("DataDate", "==", pd.to_datetime(day))]
+        ).droplevel(0)
+    else:
+        lb_day = None
 
     # v0：行业 + 市值
     edge_day = pd.read_parquet(
@@ -247,10 +300,16 @@ def get_day_data(
         return None
     ei_v3, codes_v3 = v3
 
-    avail_idx = ft_day.index.intersection(lb_day.index)
     edge_day = edge_day[edge_day["IndustryCodeNew"].notna() & edge_day["FloatMarketCap"].notna()]
 
-    # 基础对齐：特征 ∩ 标签 ∩ (行业+市值) ∩ v{n1} 节点 ∩ v{n2} 节点
+    # 对齐：
+    #   训练/验证集：特征 ∩ 标签 ∩ (行业+市值) ∩ v{n1} 节点 ∩ v{n2} 节点
+    #   测试集：特征 ∩ (行业+市值) ∩ v{n1} 节点 ∩ v{n2} 节点（不用标签对齐）
+    if not test_set:
+        avail_idx = ft_day.index.intersection(lb_day.index)
+    else:
+        avail_idx = ft_day.index
+
     base_nodes = (avail_idx
                   .intersection(edge_day.index)
                   .intersection(pd.Index(codes_v2))
@@ -279,7 +338,8 @@ def get_day_data(
 
     nodes = nodes.sort_values()
     ft_day = ft_day.loc[nodes]
-    lb_day = lb_day.loc[nodes]
+    if not test_set:
+        lb_day = lb_day.loc[nodes]
     edge_day = edge_day.loc[nodes]
 
     # v0 概念：行业整数编码（每日独立）
@@ -320,11 +380,19 @@ def get_avail_days_and_split(
     valid_start: str, valid_end: str,
     test_start: str
 ):
+    """获取可用交易日并划分训练/验证/测试集。
+
+    训练/验证集日期：特征 ∩ 边 ∩ 标签（需要标签）
+    测试集日期：特征 ∩ 边（不依赖标签）
+    """
     ft_days = pd.read_parquet(path=FEATURE_PATH, columns=[]).index.get_level_values('DataDate').unique()
     edge_days = pd.read_parquet(path=EDGE_PATH, columns=["DataDate"])["DataDate"].unique()
-    lb_days = pd.read_parquet(path="data/label/stock_ret.pqt", columns=[]).index.get_level_values('DataDate').unique()
+    lb_days = pd.read_parquet(path=LABEL_PATH, columns=[]).index.get_level_values('DataDate').unique()
 
-    days = ft_days.intersection(pd.DatetimeIndex(edge_days)).intersection(lb_days)
+    # 训练/验证集日期：需要与标签对齐
+    days_with_label = ft_days.intersection(pd.DatetimeIndex(edge_days)).intersection(lb_days)
+    # 测试集日期：不依赖标签
+    days_all = ft_days.intersection(pd.DatetimeIndex(edge_days))
 
     train_start = pd.Timestamp(train_start)
     train_end = pd.Timestamp(train_end)
@@ -333,20 +401,22 @@ def get_avail_days_and_split(
     test_start = pd.Timestamp(test_start)
 
     splits = {
-        "train": days[(days >= train_start) & (days <= train_end)],
-        "valid": days[(days >= valid_start) & (days <= valid_end)],
-        "test": days[days >= test_start]
+        "train": days_with_label[(days_with_label >= train_start) & (days_with_label <= train_end)],
+        "valid": days_with_label[(days_with_label >= valid_start) & (days_with_label <= valid_end)],
+        "test": days_all[days_all >= test_start]
     }
 
-    return splits, days.sort_values()
+    return splits, days_all.sort_values()
 
 
-def build_and_save_split(split_name, days, all_days, label_mark="Return5d", n_jobs=32):
+def build_and_save_split(split_name, days, all_days, label_mark: str | None = None, n_jobs=32):
     """并行生成每个交易日的三概念 + 未来特征截面数据，按日期顺序保存为单个 .pt 文件。
 
     保存格式：{"days": [int, ...], "data_list": [dict, ...]}
     训练/验证集样本包含 x_fut；测试集不包含（y 为股票代码，方便导出预测值）。
     """
+    if label_mark is None:
+        label_mark = LABEL_MARK if LABEL_MARK is not None else HORIZON_TO_LABEL_MARK[DEFAULT_HORIZON]
     days = pd.DatetimeIndex(days).sort_values()
     day_strs = days.strftime("%Y-%m-%d").tolist()
     day_ints = (days.year * 10000 + days.month * 100 + days.day).tolist()
@@ -374,7 +444,7 @@ def build_and_save_split(split_name, days, all_days, label_mark="Return5d", n_jo
     if n_train_fut_missing > 0:
         print(f"[{split_name}] 警告: {n_train_fut_missing} 天因缺少未来 {FUT_SHIFT} 交易日数据将被剔除")
 
-    print(f"[{split_name}] 交易日数量: {len(day_strs)}，并行生成中 ...")
+    print(f"[{split_name}] 交易日数量: {len(day_strs)}，标签列: {label_mark}，并行生成中 ...")
     data_list = Parallel(n_jobs=n_jobs, backend="loky", verbose=10)(
         delayed(get_day_data)(d, fd, label_mark, test_set) for d, fd in day_fut_pairs
     )
@@ -433,6 +503,7 @@ if __name__ == "__main__":
     print(f"固定边: v0(行业) | 第二边: v{args.edge_version_2} | 第三边: v{args.edge_version_3}")
     print(f"EDGE_DIR_2={EDGE_DIR_2}, EDGE_DIR_3={EDGE_DIR_3}")
     print(f"特征: freq={args.freq} lags={args.lags} | FEATURE_PATH={FEATURE_PATH}")
+    print(f"标签: LABEL_PATH={LABEL_PATH} | 标签列: {LABEL_MARK} (horizon={args.horizon})")
     print(f"未来特征偏移: {FUT_SHIFT} 个交易日")
     print(f"保存目录: {SAVE_DIR}")
 

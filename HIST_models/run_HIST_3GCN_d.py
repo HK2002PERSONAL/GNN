@@ -1,17 +1,16 @@
-"""HIST_models_batch2：HIST_3GCN（三层 GCN 减法剥离）训练脚本（daily batch）
+"""HIST_models：HIST_a11_d（GCN + GCN + GCN，MLP 输出头）训练脚本（daily batch）
 
-模型 HIST_3GCN 用三个 GCN_InfoShare_block 串联，每层通过减法（x - p_info）从隐藏表征中
-剥离当前概念信息，再送入下一层。需要三种预定义概念（边）：
+模型 HIST_a11_d 继承自 HIST_a11，三个 GCN_InfoShare_block 串联，
+区别在于输出头使用两层 MLP（Linear → SiLU → Linear）替代单层线性层。
+
+需要三种预定义概念（边）：
     概念 1 (v0)  : 一级行业      —— IndustryCodeNew（固定）
     概念 2 (v{n1}): 第二版边连通分量（开放选择）
     概念 3 (v{n2}): 第三版边连通分量（开放选择）
 
-减法剥离流程：
-    x_hidden -> GCN_1(concept_1) -> subtract -> GCN_2(concept_2) -> subtract -> GCN_3(concept_3) -> subtract
-    最终输出 = gate(p1_info) + gate(p2_info) + gate(p3_info) + i_info
-
 数据由 DataBuilder/hist_data_builder/build_GCN_GCN_GCN_data.py 产出：
-    data/hist_{freq}_lag{lag1}_{lag2}_..._v0v{n1}v{n2}/{train,valid,test}.pt
+    data/hist_{freq}_lag{lag1}_{lag2}_..._v0v{n1}v{n2}_{label_name}/{train,valid,test}.pt
+    其中 label_name 为标签文件名（不含扩展名），如 stock_ret、spec_ret（默认 stock_ret）
 
     样本字段：
         x             [N, F] 特征
@@ -23,13 +22,15 @@
         date          [3]    年/月/日
 
 运行：
-    python HIST_models_batch2/run_HIST_3GCN.py --edge-version-2 14 --edge-version-3 2
-    python HIST_models_batch2/run_HIST_3GCN.py -v2 14 -v3 2 --hidden_size 64 --clip 0.04
+    python HIST_models/run_HIST_a11_d.py --edge-version-2 2 --edge-version-3 3
+    python HIST_models/run_HIST_a11_d.py -v2 2 -v3 3 --hidden_size 64 --clip 0.04
+    python HIST_models/run_HIST_a11_d.py -v2 2 -v3 3 --label data/label/spec_ret.pqt
 
-输出：model_configs/best_hist_Hist_3GCN_{data_version}_{clip_mark}{ew_mark}/
-      model_outputs/hist_test_Hist_3GCN_{data_version}_{clip_mark}{ew_mark}.pqt
+输出：model_configs/best_hist_a11_d_{data_version}_{clip_mark}{ew_mark}/
+      model_outputs/hist_test_a11_d_{data_version}_{clip_mark}{ew_mark}.pqt
 """
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -43,7 +44,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from models import HIST_3GCN
+from models import HIST_a11_d
 from data_utils import get_dataloader
 from utils.Logger import smart_log, make_log_file
 from utils.SeedManager import seed_all_non_torch, seed_torch_all
@@ -90,10 +91,57 @@ class ICLoss(nn.Module):
         return - xm.dot(ym) / denom
 
 
+class CCCLoss(nn.Module):
+    def __init__(self, eps: float = 1e-8, clamp: float = 5.0):
+        super().__init__()
+        self.eps = eps
+        self.clamp = clamp
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        x: 预测值，[N] 或 [N, 1]
+        y: 真实标签，[N] 或 [N, 1]
+        """
+        x = x.reshape(-1).float()
+        y = y.reshape(-1).float()
+
+        # 仅保留预测值和标签都有效的样本
+        mask = torch.isfinite(x) & torch.isfinite(y)
+        x = x[mask]
+        y = y[mask]
+
+        if x.numel() < 2:
+            return x.sum() * 0.0
+
+        # 仅截断极值，不做均值移除或截面标准化
+        x = x.clamp(-self.clamp, self.clamp)
+        y = y.clamp(-self.clamp, self.clamp)
+
+        x_mean = x.mean()
+        y_mean = y.mean()
+
+        x_centered = x - x_mean
+        y_centered = y - y_mean
+
+        x_var = x_centered.pow(2).mean()
+        y_var = y_centered.pow(2).mean()
+        covariance = (x_centered * y_centered).mean()
+
+        denominator = (
+            x_var
+            + y_var
+            + (x_mean - y_mean).pow(2)
+        ).clamp_min(self.eps)
+
+        ccc = 2.0 * covariance / denominator
+
+        return 1.0 - ccc
+
+
 # ---------------- 前向 ----------------
 
 def model_forward(_model, _sample, _device, _edge_v2: int, _edge_v3: int):
-    """把单个日截面样本喂给 HIST_3GCN，返回预测值 [N]。
+    """把单个日截面样本喂给 HIST_a11_d，返回预测值 [N]。
 
     概念 1 = v0 行业（固定），概念 2 = v{edge_v2}，概念 3 = v{edge_v3}。
     """
@@ -148,7 +196,7 @@ def evaluate(_model, _loader, _loss, _device, _edge_v2: int, _edge_v3: int):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="HIST_3GCN（三层 GCN 减法剥离，v0 行业 + 第二边 + 第三边）训练")
+    parser = argparse.ArgumentParser(description="HIST_a11_d（GCN+GCN+GCN，MLP 输出头，v0 行业 + 第二边 + 第三边）训练")
     parser.add_argument("--freq", type=str, default="1D", choices=["1D", "five_minute"])
     parser.add_argument("--spans", type=int, nargs="+", default=[20, 60, 120], help="回溯天数列表，如: 20 60 120")
     parser.add_argument("--edge-version-2", "-v2", type=int, default=14, choices=[2, 3, 7, 9, 10, 12, 14],
@@ -167,12 +215,16 @@ def parse_args():
                         help="第二层是否使用 edge_weight，1=使用（默认），0=不使用")
     parser.add_argument("--ew3", type=int, default=1, choices=[0, 1],
                         help="第三层是否使用 edge_weight，1=使用（默认），0=不使用")
+    parser.add_argument("--label", type=str, default="data/label/stock_ret.pqt",
+                        help="标签文件路径（.pqt 格式），默认 data/label/stock_ret.pqt")
+    parser.add_argument("--loss", type=str, default="ICLoss", choices=["ICLoss", "CCCLoss"],
+                        help="训练损失函数选择（验证集仍使用 ICLoss），默认 ICLoss")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    model_id = "Hist_3GCN"
+    model_id = "a11_d"
 
     # 校验：第二边和第三边版本不能相同
     if args.edge_version_2 == args.edge_version_3:
@@ -184,19 +236,29 @@ if __name__ == "__main__":
     else:
         clip_mark = f"c{clip:.1f}"
 
-    # 数据版本：{freq}_lag{spans}_v0v{edge_v2}v{edge_v3}
-    data_version = f"{args.freq}_lag{'_'.join([str(span) for span in args.spans])}_v0v{args.edge_version_2}v{args.edge_version_3}"
+    # 标签名称（不含扩展名），用于数据版本与输出路径命名
+    if not args.label.endswith(".pqt"):
+        raise ValueError(f"标签文件必须为 .pqt 格式: {args.label}")
+    label_name = os.path.splitext(os.path.basename(args.label))[0]
+
+    # 数据版本：{freq}_lag{spans}_v0v{edge_v2}v{edge_v3}_{label_name}
+    data_version = f"{args.freq}_lag{'_'.join([str(span) for span in args.spans])}_v0v{args.edge_version_2}v{args.edge_version_3}_{label_name}"
 
     ew1 = bool(args.ew1); ew_mark = 'ew1[off]' if not ew1 else ''
     ew2 = bool(args.ew2); ew_mark = ew_mark + 'ew2[off]' if not ew2 else ew_mark
     ew3 = bool(args.ew3); ew_mark = ew_mark + 'ew3[off]' if not ew3 else ew_mark
-    ckpt_path = f"model_configs/best_hist_{model_id}_{data_version}_{clip_mark}{'_' + ew_mark if len(ew_mark) else ''}"
-    out_path = f"model_outputs/hist_test_{model_id}_{data_version}_{clip_mark}{'_' + ew_mark if len(ew_mark) else ''}.pqt"
+    
+    # 损失函数标记（使用非默认损失时添加到输出路径）
+    loss_mark = f"_{args.loss}"
+    
+    ckpt_path = f"model_configs/best_hist_{model_id}_{data_version}_{clip_mark}{'_' + ew_mark if len(ew_mark) else ''}{loss_mark}"
+    out_path = f"model_outputs/hist_test_{model_id}_{data_version}_{clip_mark}{'_' + ew_mark if len(ew_mark) else ''}{loss_mark}.pqt"
 
     make_log_file()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     smart_log(f"device = {device}")
     smart_log(f"model = HIST_{model_id} | data = {data_version} | hidden_size = {args.hidden_size} | ew1 = {ew1} | ew2 = {ew2} | ew3 = {ew3}")
+    smart_log(f"label = {args.label} | train_loss = {args.loss}")
 
     seed_all_non_torch(root_seed)
 
@@ -208,7 +270,16 @@ if __name__ == "__main__":
     d_feat = train_loader.dataset[0]["x"].shape[1]
     smart_log(f"d_feat = {d_feat}")
 
-    criterion = ICLoss()
+    # 训练损失函数（可选），验证集统一使用 ICLoss
+    if args.loss == "ICLoss":
+        criterion = ICLoss()
+    elif args.loss == "CCCLoss":
+        criterion = CCCLoss()
+    else:
+        raise ValueError(f"不支持的损失函数: {args.loss}")
+    
+    # 验证集统一使用 ICLoss
+    valid_criterion = ICLoss()
 
     Path(ckpt_path).mkdir(parents=True, exist_ok=True)
 
@@ -224,13 +295,13 @@ if __name__ == "__main__":
         smart_log(f"training {torch_seed}")
         seed_torch_all(torch_seed)
 
-        model = HIST_3GCN(d_feat=d_feat, hidden_size=args.hidden_size, clip=clip, ew1=ew1, ew2=ew2, ew3=ew3).to(device)
+        model = HIST_a11_d(d_feat=d_feat, hidden_size=args.hidden_size, clip=clip, ew1=ew1, ew2=ew2, ew3=ew3).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
         best_ic, wait = np.inf, 0
         for epoch in range(1, args.epochs + 1):
             train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, edge_v2, edge_v3)
-            ic, icir = evaluate(model, valid_loader, criterion, device, edge_v2, edge_v3)
+            ic, icir = evaluate(model, valid_loader, valid_criterion, device, edge_v2, edge_v3)
             smart_log(f"epoch {epoch:3d} | train loss {train_loss:.4f} | valid IC {ic:.4f} | ICIR {icir:.4f}")
 
             if ic < best_ic:
@@ -243,7 +314,7 @@ if __name__ == "__main__":
                     smart_log("early stopping")
                     break
 
-    modelS = {iter_seed: HIST_3GCN(d_feat=d_feat, hidden_size=args.hidden_size, clip=clip, ew1=ew1, ew2=ew2, ew3=ew3).to(device) for iter_seed in torch_seed_range}
+    modelS = {iter_seed: HIST_a11_d(d_feat=d_feat, hidden_size=args.hidden_size, clip=clip, ew1=ew1, ew2=ew2, ew3=ew3).to(device) for iter_seed in torch_seed_range}
     for model_num in torch_seed_range:
         modelS[model_num].load_state_dict(torch.load(
             Path(ckpt_path) / f"{model_num}.pt",

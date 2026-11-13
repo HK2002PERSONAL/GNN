@@ -1,6 +1,6 @@
 import os
 import json
-from typing import List
+from typing import Tuple, List, Literal
 
 import pandas as pd
 import numpy as np
@@ -8,9 +8,9 @@ from tqdm import tqdm
 from joblib import Parallel, delayed
 
 from .utils.run_cmd import run_shell_cmd_with_file_addition_check
-from .utils.pdf_processor import merge_all_pdfs
+from .utils.pdf_processor import merge_all_pdfs, merge_pdfs_horizontal
 
-def format_testor(name: str, neutral_factor: List[str]):
+def format_testor(name: str, neutral_factor: List[str], field: str):
 
     # 创建新的config
     with open(os.path.join('BackTester', 'config', 'config.json'), 'r', encoding='utf-8') as f:
@@ -18,6 +18,8 @@ def format_testor(name: str, neutral_factor: List[str]):
     
     # 默认中性化lncap
     config["neutralize"] = ['lncap'] if neutral_factor is None else neutral_factor
+
+    config["universe"] = field
 
     with open(os.path.join(name, f'{name}config.json'), 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=4, ensure_ascii=False)
@@ -28,7 +30,7 @@ def format_testor(name: str, neutral_factor: List[str]):
 
     batchconfig['config_path'] = os.path.join(name, f'{name}config.json')
     batchconfig['data_directory'] = os.path.join(name, 'factor_data')
-    batchconfig['foldername'] = os.path.join(name, 'factor_result')
+    batchconfig['foldername'] = os.path.join(name, f"factor_result_{field}")
 
     batchconfig_file = os.path.join(name, f'{name}batchconfig.json')
     with open(batchconfig_file, 'w', encoding='utf-8') as f:
@@ -54,7 +56,8 @@ def batch_test(
     winsorize: bool = False,
     smooth_decay: int = 0, 
     neutral_factor: List[str] = None,
-    ic_threshold: float = 0.01
+    ic_threshold: float = 0.01,
+    field: Literal["allmarket", "hs300", "zz500", "zz1000"] = "allmarket"
 ):
 
     if neutral_factor is None:
@@ -78,9 +81,11 @@ def batch_test(
         data.clip(-5, 5, inplace=True)
         name = name + "_WS"
 
+    result_field = f"factor_result_{field}"
+
     os.makedirs(name, exist_ok=True)
     os.makedirs(os.path.join(name, 'factor_data'), exist_ok=True)
-    os.makedirs(os.path.join(name, 'factor_result'), exist_ok=True)
+    os.makedirs(os.path.join(name, result_field), exist_ok=True)
 
     def _format_factor(factor_name):
         _factor = data[[factor_name]].dropna()
@@ -94,15 +99,66 @@ def batch_test(
 
     print("Running BackTest")
     expected_folders = os.listdir(os.path.join(name, "factor_data"))
-    run_shell_cmd_with_file_addition_check(name, format_testor(name, neutral_factor), os.path.join(name, 'factor_result'), expected_folders)
+    run_shell_cmd_with_file_addition_check(name, format_testor(name, neutral_factor, field), os.path.join(name, result_field), expected_folders)
 
     print("Arranging")
-    merge_all_pdfs(name, os.path.join(name, f"{name}.pdf"))
+    merge_all_pdfs(os.path.join(name, result_field), os.path.join(name, result_field, f"{name}.pdf"))
 
-    result = pd.read_csv(os.path.join(name, "factor_result", "state_factor_return.csv"))
+    result = pd.read_csv(os.path.join(name, result_field, "state_factor_return.csv"))
     result.index = result['filename'].str.split('/').str[-2].str.split('.').str[0]
     good_factors = get_good_factor(result, ic_threshold)
     result.loc[good_factors].sort_index().to_csv(os.path.join(name, f"{name}.csv"))
     
     return data[good_factors]
 
+
+def batch_test_multi_field(
+    data: pd.DataFrame, 
+    name: str, 
+    neg_corr: bool = False, 
+    winsorize: bool = False,
+    smooth_decay: int = 0, 
+    neutral_factor: List[str] = None,
+    ic_threshold: float = 0.01,
+    fields: Tuple[str] = ("allmarket", "hs300", "zz500", "zz1000"),
+    merge_horizontal: bool = True
+):
+    """
+    multi field test
+    
+    Parameters
+    ----------
+    merge_horizontal : bool
+        若为 True，在所有 field 回测完成后，将各 field 的合并 PDF 横向拼接成一个总 PDF。
+        输出文件为 {name}/{name}_horizontal.pdf
+    """
+    for field in fields:
+        print(f"\n===back testing {field}===\n")
+        batch_test(data, name, neg_corr, winsorize, smooth_decay, neutral_factor, ic_threshold, field)
+    
+    if merge_horizontal:
+        print("\n===横向拼接各 field PDF===\n")
+        
+        # 计算实际使用的名称（与 batch_test 中的逻辑保持一致）
+        actual_name = name
+        if smooth_decay:
+            actual_name = actual_name + f"_EWM{smooth_decay}"
+        if neg_corr:
+            actual_name = actual_name + "_NEG"
+        if winsorize:
+            actual_name = actual_name + "_WS"
+        
+        pdf_paths = []
+        for field in fields:
+            result_field = f"factor_result_{field}"
+            pdf_path = os.path.join(actual_name, result_field, f"{actual_name}.pdf")
+            if os.path.exists(pdf_path):
+                pdf_paths.append(pdf_path)
+            else:
+                print(f"警告: 未找到 {pdf_path}，跳过")
+        
+        if pdf_paths:
+            output_path = os.path.join(actual_name, f"{actual_name}_horizontal.pdf")
+            merge_pdfs_horizontal(pdf_paths, output_path)
+        else:
+            print("警告: 未找到任何需要横向拼接的 PDF 文件")

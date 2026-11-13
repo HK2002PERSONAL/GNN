@@ -4,8 +4,6 @@ import torch
 import torch.nn as nn
 from torch_geometric.nn import GATv2Conv, GCNConv, LayerNorm
 
-from model_additional import HLGCNConv
-
 
 class HIST_block_base(nn.Module):
 
@@ -334,35 +332,6 @@ class GCN_InfoShare_block(HIST_block_base):
         back_info = self.fc_back(shared_info)
 
         return fore_info, back_info
-
-
-class HLGCN_InfoShare_block(GCN_InfoShare_block):
-    """高通滤波版本的GCN，扩大不同边的差异"""
-    # pylint:disable=W0231
-    def __init__(self, hidden_size: int = 64, dropout: float = 0.0, ew: bool = True):
-        # pylint:disable=W0233
-        HIST_block_base.__init__(self, hidden_size=hidden_size)
-        self.conv1 = HLGCNConv(hidden_size, hidden_size)
-        self.conv2 = HLGCNConv(hidden_size, hidden_size)
-        self.norm1 = LayerNorm(hidden_size)
-        self.norm2 = LayerNorm(hidden_size)
-        self.drop = nn.Dropout(dropout)
-        self.ew = ew
-
-
-class HLGCN_InfoShare_block_v2(GCN_InfoShare_block):
-    """高通滤波版本的GCNV2，与超图实际理念对齐，扩大不同边的差异"""
-    # pylint:disable=W0231
-    def __init__(self, hidden_size: int = 64, dropout: float = 0.0, ew: bool = True):
-        # pylint:disable=W0233
-        HIST_block_base.__init__(self, hidden_size=hidden_size)
-        self.conv1 = HLGCNConv(hidden_size, hidden_size)
-        self.conv2 = GCNConv(hidden_size, hidden_size)
-        self.norm1 = LayerNorm(hidden_size)
-        self.norm2 = LayerNorm(hidden_size)
-        self.drop = nn.Dropout(dropout)
-        self.ew = ew
-
 
 
 class Risk_Attention_block(HIST_block_base):

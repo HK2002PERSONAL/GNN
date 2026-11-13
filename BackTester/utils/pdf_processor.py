@@ -1,6 +1,6 @@
 import os
 import string
-from pypdf import PdfWriter, PdfReader
+from pypdf import PdfWriter, PdfReader, Transformation
 from pypdf.errors import PyPdfError
 
 
@@ -109,3 +109,49 @@ def merge_all_pdfs(root_dir, output_filename="merged_output.pdf", split_pdf: boo
             
     except (OSError, PyPdfError) as e:  # 精准捕获系统IO错误和PDF损坏错误
         print(f"文件处理或合并过程中出错: {e}")
+
+
+def merge_pdfs_horizontal(pdf_paths, output_path):
+    """
+    将多个 PDF 按页横向拼接（左右拼）：
+    - 每个输入 PDF 有 N 页，输出 PDF 页数为所有输入页数的最大值
+    - 输出第 i 页 = 所有输入第 i 页从左到右拼接
+    """
+    # 过滤存在的文件
+    valid_paths = [p for p in pdf_paths if os.path.exists(p)]
+    if not valid_paths:
+        print("横向拼接：未找到任何有效的 PDF 文件。")
+        return None
+
+    readers = [PdfReader(p) for p in valid_paths]
+    page_counts = [len(r.pages) for r in readers]
+    n_pages = max(page_counts)
+    print(f"横向拼接输入文件页数: {dict(zip(valid_paths, page_counts))}, 输出页数: {n_pages}")
+
+    writer = PdfWriter()
+    for i in range(n_pages):
+        pages = [r.pages[i] for r in readers if i < len(r.pages)]
+        widths = [float(p.mediabox.width) for p in pages]
+        heights = [float(p.mediabox.height) for p in pages]
+        total_w = sum(widths)
+        max_h = max(heights)
+
+        blank = writer.add_blank_page(width=total_w, height=max_h)
+
+        x_offset = 0.0
+        for p in pages:
+            # 将源页平移到 (x_offset, 0)，并修正源页自身的 mediabox 原点
+            tx = x_offset - float(p.mediabox.left)
+            ty = -float(p.mediabox.bottom)
+            blank.merge_transformed_page(p, Transformation().translate(tx, ty))
+            x_offset += float(p.mediabox.width)
+
+    try:
+        with open(output_path, "wb") as f:
+            writer.write(f)
+        writer.close()
+        print(f"横向拼接完成，输出: {os.path.abspath(output_path)}")
+        return output_path
+    except (OSError, PyPdfError) as e:
+        print(f"横向拼接写入文件出错: {e}")
+        return None
